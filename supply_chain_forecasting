@@ -1,0 +1,305 @@
+WITH 
+-- ======================================================================================
+-- SECTION 1: DIMENSIONS & INVENTORY SNAPSHOTS
+-- ======================================================================================
+
+-- 1. Product Dimension
+-- Grain: One row per Product SKU
+-- Purpose: Central source for product metadata, unit costs, and the manual "Days to Ship" lead time.
+dim_product AS (
+    SELECT 
+        prd.product_sku,
+        prd.product_name,
+        prd.product_status,
+        prd.unit_price,
+        prd.target_sales_goal, 
+        -- Ensure this is a number to avoid null math errors later
+        COALESCE(prd.Days_to_Ship_over_Sea, 0) as Days_to_Ship_over_Sea
+    FROM 
+        `abc_company.abc_company_stage.stg_dim_product` prd 
+),
+
+-- 2. PO Management
+-- Grain: One row per Product SKU
+-- Purpose: Aggregates open purchase orders to determine inventory currently "In Transit" to the warehouse.
+po_mgmt AS (
+    SELECT 
+        product_sku,
+        SUM(units_ordered) AS in_transit_to_ffe
+    FROM 
+        `abc_company.abc_company_stage.stg_gs_inventory_po_management`
+    WHERE 
+        order_status NOT IN ('Completed','Discrepency','Production','Stored','Unknown','Cancel')
+    GROUP BY 1
+),
+
+-- 3. Shipping Costs
+-- Grain: One row per Product SKU
+-- Purpose: Provides the average shipping cost per unit to calculate "Landed Cost" estimates.
+shipping_costs AS (
+    SELECT 
+      product_sku,
+      shipping_amount_per_unit
+    FROM `abc_company.abc_company_intermediate.vw_int_product_shipping_allocations`
+),
+
+-- 4. Sellerise (Amazon) Data
+-- Grain: One row per Product SKU
+-- Purpose: Brings in Amazon-specific inventory levels and their internal sales velocity stats.
+sellerise AS (
+    SELECT 
+      product_sku,
+      current_amazon_inventory, 
+      in_transit_to_amazon,
+      daily_avg_units_sold_last_30_days,
+      daily_avg_units_sold_last_90_days,
+      amazon_forecast_days_on_hand
+    FROM `abc_company.abc_company_stage.stg_gs_sellerise_summary`
+),
+
+-- 5. FFE Inventory (Warehouse)
+-- Grain: One row per Product SKU
+-- Purpose: Provides the current physical stock count in the main warehouse (FFE).
+ffe_current_inventory AS (
+    SELECT 
+        product_sku,
+        SUM(units) AS ffe_current_inventory
+    FROM 
+        `abc_company.abc_company_stage.stg_ffe_inventory_transactions`
+    GROUP BY 1
+),
+
+-- ======================================================================================
+-- SECTION 2: FORECASTING ENGINE
+-- ======================================================================================
+
+-- 6. Historical Sales (Last 365 Days)
+-- Grain: Product SKU + Date (Daily)
+-- Purpose: Extracts the exact daily sales shape from the previous year to use as the baseline for the forecast.
+historical_daily_sales AS ( 
+    SELECT 
+        product_sku,
+        transaction_date,
+        SUM(units) AS daily_units
+    FROM 
+        `abc_company.abc_company_prod.vw_sales_transactions`
+    WHERE 
+        transaction_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 YEAR)
+        AND transaction_date < CURRENT_DATE() 
+    GROUP BY 
+        1,2
+),
+
+-- 7. Recent Sales Velocity (Context Stats)
+-- Grain: One row per Product SKU
+-- Purpose: Calculates flat 30/90 day averages to provide context alongside the seasonal forecast.
+recent_sales_velocity AS (
+    SELECT
+        product_sku,
+        SAFE_DIVIDE(SUM(CASE WHEN transaction_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) THEN units ELSE 0 END), 30) AS avg_daily_sales_30d,
+        SAFE_DIVIDE(SUM(CASE WHEN transaction_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY) THEN units ELSE 0 END), 90) AS avg_daily_sales_90d
+    FROM 
+        `abc_company.abc_company_prod.vw_sales_transactions`
+    WHERE 
+        transaction_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+    GROUP BY 
+        1
+),
+
+-- 8. The Loop (Timeline Extension)
+-- Grain: Product SKU + Date (Daily)
+-- Purpose: Stacks historical data 3 times to create a 3-year future timeline (approx 1,000 days) for long-term forecasting.
+extended_sales_timeline AS (
+    SELECT product_sku, transaction_date, daily_units, 1 AS year_offset FROM historical_daily_sales
+    UNION ALL
+    SELECT product_sku, transaction_date, daily_units, 2 AS year_offset FROM historical_daily_sales
+    UNION ALL
+    SELECT product_sku, transaction_date, daily_units, 3 AS year_offset FROM historical_daily_sales
+),
+
+-- 9. Burn Rate Simulation
+-- Grain: Product SKU + Future Date (Daily)
+-- Purpose: Runs the cumulative sum (running total) of projected sales against current inventory to simulate the "Burn Down."
+Burn_Rate_Simulation AS (
+    SELECT 
+        h.product_sku,
+        h.year_offset,
+        DATE_ADD(h.transaction_date, INTERVAL h.year_offset YEAR) AS projected_future_date,
+        
+        -- Total Inventory (Warehouse + Amazon + Amazon Transit)
+        (COALESCE(i.ffe_current_inventory,0) + COALESCE(s.current_amazon_inventory,0) + COALESCE(s.in_transit_to_amazon,0)) AS current_inventory,
+        
+        -- Scenario 1: Business as Usual
+        SUM(h.daily_units) OVER (
+            PARTITION BY h.product_sku 
+            ORDER BY h.year_offset ASC, h.transaction_date ASC
+        ) AS cumulative_sales_BAU,
+
+        -- Scenario 2: Growth Goal (Historical * Goal Multiplier)
+        SUM(h.daily_units * (1 + COALESCE(p.target_sales_goal, 0))) OVER (
+            PARTITION BY h.product_sku 
+            ORDER BY h.year_offset ASC, h.transaction_date ASC
+        ) AS cumulative_sales_with_goal,
+        
+        -- Pass-through columns for the next step
+        h.daily_units AS projected_daily_units,
+        p.target_sales_goal
+
+    FROM 
+        extended_sales_timeline h
+        LEFT JOIN ffe_current_inventory i ON h.product_sku = i.product_sku
+        LEFT JOIN sellerise s ON s.product_sku = h.product_sku
+        LEFT JOIN dim_product p ON h.product_sku = p.product_sku
+),
+
+-- 10. Find the Break Point (Stockout Date)
+-- Grain: One row per Product SKU
+-- Purpose: Identifies the exact date where Cumulative Sales exceed Current Inventory for both scenarios.
+raw_forecast AS (
+    SELECT 
+        product_sku,
+        current_inventory,
+        MIN(CASE WHEN cumulative_sales_BAU >= current_inventory THEN projected_future_date END) AS stockout_date_BAU,
+        MIN(CASE WHEN cumulative_sales_with_goal >= current_inventory THEN projected_future_date END) AS stockout_date_GOAL
+    FROM 
+        Burn_Rate_Simulation
+    GROUP BY 
+        1,2
+),
+
+-- 11. Future Demand Projection (Smart Reorder Engine)
+-- Grain: One row per Product SKU
+-- Purpose: Calculates the exact units needed for the 6mo/1yr period STARTING from the specific stockout date of that product.
+future_demand_projection AS (
+    SELECT
+        f.product_sku,
+        
+        -- Sum projected sales between [Stockout Date] and [Stockout Date + 6 Months]
+        SUM(CASE 
+            WHEN t.projected_future_date > f.stockout_date_BAU 
+                 AND t.projected_future_date <= DATE_ADD(f.stockout_date_BAU, INTERVAL 6 MONTH)
+            THEN t.projected_daily_units
+            ELSE 0 
+        END) as qty_needed_next_6mo_BAU,
+
+        -- Sum projected sales between [Stockout Date] and [Stockout Date + 1 Year]
+        SUM(CASE 
+            WHEN t.projected_future_date > f.stockout_date_BAU 
+                 AND t.projected_future_date <= DATE_ADD(f.stockout_date_BAU, INTERVAL 1 YEAR)
+            THEN t.projected_daily_units
+            ELSE 0 
+        END) as qty_needed_next_1yr_BAU
+
+    FROM
+        raw_forecast f
+        INNER JOIN Burn_Rate_Simulation t ON f.product_sku = t.product_sku
+    GROUP BY
+        1
+),
+
+-- 12. Final Forecast Formatting
+-- Grain: One row per Product SKU
+-- Purpose: Formats dates into strings for reporting and calculates "Days on Hand" integers.
+abc_company_forecast AS (
+    SELECT 
+        f.product_sku,
+        f.current_inventory,
+        -- Internal Calculation Names (Renamed in Final Select)
+        ROUND(r.avg_daily_sales_30d, 2) AS global_avg_sales_last_30_days,
+        ROUND(r.avg_daily_sales_90d, 2) AS global_avg_sales_last_90_days,
+        
+        f.stockout_date_BAU, 
+        f.stockout_date_GOAL, 
+        
+        CASE 
+            WHEN f.stockout_date_BAU IS NULL THEN 'Greater than 3 years'
+            ELSE CAST(f.stockout_date_BAU AS STRING)
+        END AS estimated_stockout_date_display,
+
+        DATE_DIFF(f.stockout_date_BAU, f.stockout_date_GOAL, DAY) AS days_lost_due_to_growth,
+        
+        CASE 
+            WHEN f.stockout_date_BAU IS NULL THEN 1095 -- 3 years (365*3)
+            ELSE DATE_DIFF(f.stockout_date_BAU, CURRENT_DATE(), DAY)
+        END AS days_on_hand
+
+    FROM 
+        raw_forecast f
+        LEFT JOIN recent_sales_velocity r ON f.product_sku = r.product_sku
+)
+
+-- ======================================================================================
+-- SECTION 3: FINAL REPORT & REORDER LOGIC
+-- ======================================================================================
+
+SELECT 
+    prd.*,
+    
+    -- Inventory Levels
+    COALESCE(po.in_transit_to_ffe, 0) AS in_transit_to_ffe,
+    COALESCE(ffe.ffe_current_inventory, 0) AS ffe_current_inventory,
+    COALESCE(sell.in_transit_to_amazon, 0) AS in_transit_to_amazon,
+    COALESCE(sell.current_amazon_inventory, 0) AS current_amazon_inventory,
+    (COALESCE(ffe.ffe_current_inventory, 0) + COALESCE(sell.in_transit_to_amazon, 0) + COALESCE(sell.current_amazon_inventory, 0)) AS total_inventory_on_hand,
+
+    -- Shipping Costs
+    COALESCE(ship.shipping_amount_per_unit, 0) AS shipping_amount_per_unit,
+
+    -- Forecast Outputs (Global)
+    sf.estimated_stockout_date_display AS abc_company_estimated_stockout_date,
+    sf.days_on_hand AS abc_company_forecast_days_on_hand,
+
+    -- VELOCITY METRICS (SIDE-BY-SIDE)
+    -- 1. ABC_Company (Global) Velocity -- RENAMED PER REQUEST
+    COALESCE(sf.global_avg_sales_last_30_days, 0) AS abc_company_total_sales_per_day_last_30,
+    COALESCE(sf.global_avg_sales_last_90_days, 0) AS abc_company_total_sales_per_day_last_90,
+
+    -- 2. Amazon Velocity
+    COALESCE(sell.daily_avg_units_sold_last_30_days, 0) AS amazon_avg_units_sold_last_30_days,
+    COALESCE(sell.daily_avg_units_sold_last_90_days, 0) AS amazon_avg_units_sold_last_90_days,
+    COALESCE(sell.amazon_forecast_days_on_hand, 0) AS amazon_days_on_hand,
+
+    -- REORDER LOGIC: DATE CALCULATION
+    -- "Stockout Date" MINUS "Lead Time + 15% Buffer"
+    DATE_SUB(
+        sf.stockout_date_BAU, 
+        INTERVAL CAST(COALESCE(prd.Days_to_Ship_over_Sea, 0) * 1.15 AS INT64) DAY
+    ) AS recommended_reorder_date,
+
+    -- REORDER LOGIC: SUGGESTED QUANTITIES
+    -- Based on the dynamic future demand projection for this specific SKU
+    COALESCE(demand.qty_needed_next_1yr_BAU, 0) AS suggest_order_qty_1yr,
+    COALESCE(demand.qty_needed_next_6mo_BAU, 0) AS suggest_order_qty_6mo,
+
+    -- COST CALCULATIONS: 1 YEAR SUPPLY
+    (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(prd.unit_price, 0)) AS estimated_product_cost_1yr,
+    (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0)) AS estimated_shipping_cost_1yr,
+    (
+      (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(prd.unit_price, 0)) + 
+      (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0))
+    ) AS total_estimated_po_cost_1yr,
+
+    -- COST CALCULATIONS: 6 MONTH SUPPLY
+    (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(prd.unit_price, 0)) AS estimated_product_cost_6mo,
+    (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0)) AS estimated_shipping_cost_6mo,
+    
+    -- Total Landed Cost (6 Month)
+    (
+      (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(prd.unit_price, 0)) + 
+      (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0))
+    ) AS total_estimated_po_cost_6mo
+
+FROM 
+    dim_product prd 
+    LEFT JOIN po_mgmt po ON po.product_sku = prd.product_sku 
+    LEFT JOIN shipping_costs ship ON ship.product_sku = prd.product_sku 
+    LEFT JOIN sellerise sell ON sell.product_sku = prd.product_sku 
+    LEFT JOIN ffe_current_inventory ffe ON ffe.product_sku = prd.product_sku 
+    LEFT JOIN abc_company_forecast sf ON sf.product_sku = prd.product_sku 
+    LEFT JOIN future_demand_projection demand ON demand.product_sku = prd.product_sku
+    
+WHERE 
+    prd.product_sku IS NOT NULL 
+    AND prd.product_sku <> ''
+ORDER BY 
+    3 ASC
