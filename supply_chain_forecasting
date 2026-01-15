@@ -13,7 +13,6 @@ dim_product AS (
         prd.product_status,
         prd.unit_price,
         prd.target_sales_goal, 
-        -- Ensure this is a number to avoid null math errors later
         COALESCE(prd.Days_to_Ship_over_Sea, 0) as Days_to_Ship_over_Sea
     FROM 
         `abc_company.abc_company_stage.stg_dim_product` prd 
@@ -40,12 +39,13 @@ shipping_costs AS (
     SELECT 
       product_sku,
       shipping_amount_per_unit
-    FROM `abc_company.abc_company_intermediate.vw_int_product_shipping_allocations`
+    FROM 
+        `abc_company.abc_company_intermediate.vw_int_product_shipping_allocations`
 ),
 
 -- 4. Sellerise (Amazon) Data
 -- Grain: One row per Product SKU
--- Purpose: Brings in Amazon-specific inventory levels and their internal sales velocity stats.
+-- Purpose: Brings in Amazon-specific inventory levels and their internal sales velocity stats from a google sheet upload.
 sellerise AS (
     SELECT 
       product_sku,
@@ -54,10 +54,11 @@ sellerise AS (
       daily_avg_units_sold_last_30_days,
       daily_avg_units_sold_last_90_days,
       amazon_forecast_days_on_hand
-    FROM `abc_company.abc_company_stage.stg_gs_sellerise_summary`
+    FROM 
+        `abc_company.abc_company_stage.stg_gs_sellerise_summary`
 ),
 
--- 5. FFE Inventory (Warehouse)
+-- 5. Main Warehouse Data
 -- Grain: One row per Product SKU
 -- Purpose: Provides the current physical stock count in the main warehouse (FFE).
 ffe_current_inventory AS (
@@ -108,7 +109,7 @@ recent_sales_velocity AS (
 
 -- 8. The Loop (Timeline Extension)
 -- Grain: Product SKU + Date (Daily)
--- Purpose: Stacks historical data 3 times to create a 3-year future timeline (approx 1,000 days) for long-term forecasting.
+-- Purpose: Stacks historical data 3 times to create a 3-year future timeline (approx 1,000 days) for long-term forecasting.  The idea is to get a general idea if things stayed exactly the same as the prior year (from today) when inventory would run out.
 extended_sales_timeline AS (
     SELECT product_sku, transaction_date, daily_units, 1 AS year_offset FROM historical_daily_sales
     UNION ALL
@@ -152,7 +153,7 @@ Burn_Rate_Simulation AS (
         LEFT JOIN dim_product p ON h.product_sku = p.product_sku
 ),
 
--- 10. Find the Break Point (Stockout Date)
+-- 10. Find the Break Even Point (Stockout Date)
 -- Grain: One row per Product SKU
 -- Purpose: Identifies the exact date where Cumulative Sales exceed Current Inventory for both scenarios.
 raw_forecast AS (
@@ -173,7 +174,7 @@ raw_forecast AS (
 future_demand_projection AS (
     SELECT
         f.product_sku,
-        
+    --BUSINESS AS USUAL
         -- Sum projected sales between [Stockout Date] and [Stockout Date + 6 Months]
         SUM(CASE 
             WHEN t.projected_future_date > f.stockout_date_BAU 
@@ -189,7 +190,22 @@ future_demand_projection AS (
             THEN t.projected_daily_units
             ELSE 0 
         END) as qty_needed_next_1yr_BAU
-
+        
+    --SALES GOAL APPLIED
+        SUM(CASE 
+            WHEN t.projected_future_date > f.stockout_date_GOAL 
+                 AND t.projected_future_date <= DATE_ADD(f.stockout_date_GOAL, INTERVAL 6 MONTH)
+            THEN t.projected_daily_units * (1 + COALESCE(t.target_sales_goal, 0)) -- Apply the growth factor here!
+            ELSE 0 
+        END) as qty_needed_next_6mo_GOAL,
+        
+        -- NEW: Same logic for 1 Year
+        SUM(CASE 
+            WHEN t.projected_future_date > f.stockout_date_GOAL 
+                 AND t.projected_future_date <= DATE_ADD(f.stockout_date_GOAL, INTERVAL 1 YEAR)
+            THEN t.projected_daily_units * (1 + COALESCE(t.target_sales_goal, 0))
+            ELSE 0 
+        END) as qty_needed_next_1yr_GOAL
     FROM
         raw_forecast f
         INNER JOIN Burn_Rate_Simulation t ON f.product_sku = t.product_sku
@@ -228,10 +244,6 @@ abc_company_forecast AS (
         LEFT JOIN recent_sales_velocity r ON f.product_sku = r.product_sku
 )
 
--- ======================================================================================
--- SECTION 3: FINAL REPORT & REORDER LOGIC
--- ======================================================================================
-
 SELECT 
     prd.*,
     
@@ -245,49 +257,79 @@ SELECT
     -- Shipping Costs
     COALESCE(ship.shipping_amount_per_unit, 0) AS shipping_amount_per_unit,
 
-    -- Forecast Outputs (Global)
+    -- Forecast Outputs (Entire Company)
     sf.estimated_stockout_date_display AS abc_company_estimated_stockout_date,
     sf.days_on_hand AS abc_company_forecast_days_on_hand,
 
     -- VELOCITY METRICS (SIDE-BY-SIDE)
-    -- 1. ABC_Company (Global) Velocity -- RENAMED PER REQUEST
     COALESCE(sf.global_avg_sales_last_30_days, 0) AS abc_company_total_sales_per_day_last_30,
     COALESCE(sf.global_avg_sales_last_90_days, 0) AS abc_company_total_sales_per_day_last_90,
 
-    -- 2. Amazon Velocity
     COALESCE(sell.daily_avg_units_sold_last_30_days, 0) AS amazon_avg_units_sold_last_30_days,
     COALESCE(sell.daily_avg_units_sold_last_90_days, 0) AS amazon_avg_units_sold_last_90_days,
     COALESCE(sell.amazon_forecast_days_on_hand, 0) AS amazon_days_on_hand,
 
-    -- REORDER LOGIC: DATE CALCULATION
-    -- "Stockout Date" MINUS "Lead Time + 15% Buffer"
+    -- =================================================================
+    -- SCENARIO 1: BUSINESS AS USUAL (BAU)
+    -- =================================================================
+
+    -- REORDER DATE (BAU)
     DATE_SUB(
         sf.stockout_date_BAU, 
         INTERVAL CAST(COALESCE(prd.Days_to_Ship_over_Sea, 0) * 1.15 AS INT64) DAY
-    ) AS recommended_reorder_date,
+    ) AS recommended_reorder_date_bau,
 
-    -- REORDER LOGIC: SUGGESTED QUANTITIES
-    -- Based on the dynamic future demand projection for this specific SKU
-    COALESCE(demand.qty_needed_next_1yr_BAU, 0) AS suggest_order_qty_1yr,
-    COALESCE(demand.qty_needed_next_6mo_BAU, 0) AS suggest_order_qty_6mo,
+    -- QUANTITIES (BAU)
+    COALESCE(demand.qty_needed_next_1yr_BAU, 0) AS suggest_order_qty_1yr_bau,
+    COALESCE(demand.qty_needed_next_6mo_BAU, 0) AS suggest_order_qty_6mo_bau,
 
-    -- COST CALCULATIONS: 1 YEAR SUPPLY
-    (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(prd.unit_price, 0)) AS estimated_product_cost_1yr,
-    (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0)) AS estimated_shipping_cost_1yr,
-    (
-      (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(prd.unit_price, 0)) + 
-      (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0))
-    ) AS total_estimated_po_cost_1yr,
-
-    -- COST CALCULATIONS: 6 MONTH SUPPLY
-    (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(prd.unit_price, 0)) AS estimated_product_cost_6mo,
-    (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0)) AS estimated_shipping_cost_6mo,
-    
-    -- Total Landed Cost (6 Month)
+    -- PO Breakdown: 6 MONTH SUPPLY (BAU)
+    (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(prd.unit_price, 0)) AS estimated_product_cost_6mo_bau,
+    (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0)) AS estimated_shipping_cost_6mo_bau,
     (
       (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(prd.unit_price, 0)) + 
       (COALESCE(demand.qty_needed_next_6mo_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0))
-    ) AS total_estimated_po_cost_6mo
+    ) AS total_estimated_po_cost_6mo_bau,
+
+    -- PO Breakdown: 1 YEAR SUPPLY (BAU)
+    (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(prd.unit_price, 0)) AS estimated_product_cost_1yr_bau,
+    (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0)) AS estimated_shipping_cost_1yr_bau,
+    (
+      (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(prd.unit_price, 0)) + 
+      (COALESCE(demand.qty_needed_next_1yr_BAU, 0) * COALESCE(ship.shipping_amount_per_unit, 0))
+    ) AS total_estimated_po_cost_1yr_bau,
+
+    -- =================================================================
+    -- SCENARIO 2: SALES GOAL (GROWTH)
+    -- =================================================================
+
+    -- REORDER DATE (GOAL)
+    DATE_SUB(
+        sf.stockout_date_GOAL, 
+        INTERVAL CAST(COALESCE(prd.Days_to_Ship_over_Sea, 0) * 1.15 AS INT64) DAY
+    ) AS recommended_reorder_date_goal,
+
+    -- QUANTITIES (GOAL)
+    COALESCE(demand.qty_needed_next_1yr_GOAL, 0) AS suggest_order_qty_1yr_goal,
+    COALESCE(demand.qty_needed_next_6mo_GOAL, 0) AS suggest_order_qty_6mo_goal,
+
+    -- PO Breakdown: 6 MONTH SUPPLY (GOAL)
+    (COALESCE(demand.qty_needed_next_6mo_GOAL, 0) * COALESCE(prd.unit_price, 0)) AS estimated_product_cost_6mo_goal,
+    (COALESCE(demand.qty_needed_next_6mo_GOAL, 0) * COALESCE(ship.shipping_amount_per_unit, 0)) AS estimated_shipping_cost_6mo_goal,
+    (
+      (COALESCE(demand.qty_needed_next_6mo_GOAL, 0) * COALESCE(prd.unit_price, 0)) + 
+      (COALESCE(demand.qty_needed_next_6mo_GOAL, 0) * COALESCE(ship.shipping_amount_per_unit, 0))
+    ) AS total_estimated_po_cost_6mo_goal
+
+    -- PO Breakdown: 1 YEAR SUPPLY (GOAL)
+    (COALESCE(demand.qty_needed_next_1yr_GOAL, 0) * COALESCE(prd.unit_price, 0)) AS estimated_product_cost_1yr_goal,
+    (COALESCE(demand.qty_needed_next_1yr_GOAL, 0) * COALESCE(ship.shipping_amount_per_unit, 0)) AS estimated_shipping_cost_1yr_goal,
+    (
+      (COALESCE(demand.qty_needed_next_1yr_GOAL, 0) * COALESCE(prd.unit_price, 0)) + 
+      (COALESCE(demand.qty_needed_next_1yr_GOAL, 0) * COALESCE(ship.shipping_amount_per_unit, 0))
+    ) AS total_estimated_po_cost_1yr_goal,
+
+
 
 FROM 
     dim_product prd 
@@ -296,10 +338,8 @@ FROM
     LEFT JOIN sellerise sell ON sell.product_sku = prd.product_sku 
     LEFT JOIN ffe_current_inventory ffe ON ffe.product_sku = prd.product_sku 
     LEFT JOIN abc_company_forecast sf ON sf.product_sku = prd.product_sku 
-    LEFT JOIN future_demand_projection demand ON demand.product_sku = prd.product_sku
+    LEFT JOIN future_demand_projection demand ON demand.product_sku = prd.product_sku 
     
 WHERE 
     prd.product_sku IS NOT NULL 
     AND prd.product_sku <> ''
-ORDER BY 
-    3 ASC
