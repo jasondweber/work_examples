@@ -1,38 +1,32 @@
-# Inventory Forecasting & Automated Reorder Engine
+Project: Supply Chain Management & Inventory Burn-Rate Engine
 
-## Project Overview
-This SQL project demonstrates a dynamic inventory forecasting engine designed to prevent stockouts and automate purchasing decisions for a high-volume retail brand. 
+📌 Business Problem
+The e-commerce team struggled with stockouts and under-ordering due to a lack of visibility into inventory total picture and misunderstanding "burn rates." Static 30-day averages failed to account for seasonality or aggressive sales targets, leading to lost revenue during peak periods and high holding costs for slow-movers.
 
-Instead of relying on static averages, this script builds a **"Burn Down" simulation**. It combines current inventory snapshots with historical seasonal trends to project exactly when stock will run out (the "Stockout Date") and calculates the optimal reorder quantity based on lead times and growth targets.
+🚀 The Solution
+I developed a Daily Burn-Rate Simulation that merges real-time inventory levels (Warehouse, Amazon FBA, and In-Transit to Main Warehouse and Amazon Warehouse) with a 5-year seasonal sales forecast based on the past year sales behavior.
 
-## Business Problem
-Managing inventory requires balancing two risks:
-1.  **Stockouts:** Losing revenue because product isn't available.
-2.  **Overstock:** Tying up capital in inventory that moves too slowly.
+Key Features:
+Multi-Source Inventory Aggregation: Centralized data from FFE (warehouse), Amazon, and Purchase Orders to create a "True Global Stock" view.  Data is sourced from importing CSV files and Google Sheets into Big Query and Google Cloud Storage.
 
-Static formulas (e.g., "sell-through rate") often fail because they don't account for seasonality (e.g., Q4 spikes). This engine solves that by using a 365-day historical lookback to model future demand shape.
+Predictive Stockout Logic: Instead of simple math, the model runs a daily simulation to find the exact date inventory hits zero based on forecasted daily units.
 
-## Key Features
-* **Multi-Location Inventory:** Aggregates stock from 3PL warehouses (FFE), Amazon FBA, and "In Transit" purchase orders.
-* **Seasonal Forecasting:** Uses `DATE_SUB` logic to map the previous year's daily sales curve to the current year, preserving seasonal spikes.
-* **Scenario Modeling:** Runs two parallel forecasts:
-    * *Business as Usual (BAU):* Standard historical velocity.
-    * *Growth Goal:* Historical velocity multipliers to test "what if" growth scenarios.
-* **Automated Reorder Logic:** Dynamically calculates:
-    * `Recommended Reorder Date`: (Stockout Date) minus (Lead Time + Safety Buffer).
-    * `Order Quantity`: Exact units needed to cover the next 6 or 12 months *starting* from the predicted stockout date.
+Scenario Modeling: Created two distinct projections—Business as Usual (BAU) and Sales Goal (using a target_sales_goal multiplier)—allowing procurement to plan for "best-case" growth.
 
-## Technical Highlights
-This script is written in **Standard SQL (BigQuery dialect)** and utilizes several advanced techniques:
+Financial Impact: Integrated unit costs and shipping estimates to provide the Finance team with a 6-month and 12-month capital requirement forecast.
 
-* **Common Table Expressions (CTEs):** Used extensively to modularize logic into readable steps (Dimensions -> Inventory -> Forecasting -> Reporting).
-* **Window Functions:** `SUM() OVER (PARTITION BY ... ORDER BY ...)` is used to calculate the running total (cumulative sum) of future sales to simulate the inventory "burn down" day by day.
-* **Date Manipulation:** Complex date arithmetic to project historical trends into future timelines (The "Loop" logic).
-* **Handling Nulls:** Robust use of `COALESCE` and `SAFE_DIVIDE` to ensure production stability.
+🏗 Data Architecture & Logic
+The model is built using a Modular CTE approach to ensure high performance and readability:
 
-## Logic Flow
-1.  **Data Staging:** Ingests raw data from ERP, Amazon Seller Central, and 3PL feeds.
-2.  **Velocity Calculation:** Calculates 30/90-day averages for context, while pulling full 365-day history for the core model.
-3.  **Simulation:** Stacks historical data to create a 3-year future timeline and runs the cumulative sales calculation against current stock.
-4.  **Stockout Identification:** Identifies the first date where `Cumulative Sales > Total On Hand`.
-5.  **Reorder Calculation:** Back-calculates when the PO must be placed to arrive before that stockout date.
+Inventory Snapshots: Uses QUALIFY RANK() to grab the most recent month-end inventory levels across all channels.
+
+Sales Velocity: Calculates trailing 30/90-day averages across Amazon and Shopify to provide baseline context.
+
+Burn-Rate Engine: Joins current stock against a t_forecast_5_years table to identify the first date where units_running_sum >= total_inventory.
+
+Demand Projection: Calculates the specific number of units required to maintain stock for 6 and 12 months starting from the predicted stockout date.
+
+🛠 Technical Implementation Details
+Data Integrity: Implemented assertions for uniqueKey on product_sku to prevent fan-outs.
+
+Schema: Materialized as a table in the marts schema for high-speed downstream reporting in BI tools (Tableau/Looker) based on Intermediate models (I call them Transformations for my end users)
