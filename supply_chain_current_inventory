@@ -1,0 +1,77 @@
+config {
+    type: "table",
+    schema: "transformations",
+    tags: ["15 minutes"],
+    assertions: {
+        uniqueKey: ["product_sku"]
+    }
+}
+
+with 
+-- po management: tracks shipments coming to warehouse based on open POs
+shipping_to_ffe as (
+    select 
+        product_sku,
+        sum(units_ordered) as units_in_transit_to_ffe
+    from 
+        ${ref("stg_gs_inventory_po_management")}
+    where 
+        po_status not in ('complete','cancelled')
+    group by 1
+),
+
+-- ffe current inventory: retrieves latest snapshot for warehouse stock
+current_ffe as (
+    select 
+        product_sku,
+        units_running_sum_ffe
+    from 
+        ${ref('t_inventory_monthly_ffe')}
+    qualify 
+        rank() over(partition by product_sku order by month_end_date desc) = 1    
+),
+
+-- in transit to amazon: retrieves latest snapshot for stock moving to fba
+current_in_transit_to_amazon as (
+    select 
+        product_sku,
+        units_running_sum_in_transit, 
+        month_end_date
+    from 
+        ${ref('t_inventory_monthly_in_transit_to_amz')}
+    qualify 
+        rank() over(partition by product_sku order by month_end_date desc) = 1
+),
+
+-- amazon inventory: retrieves latest snapshot for live amazon stock
+current_amazon_inventory as (
+    select 
+        product_sku,
+        units_running_sum_amazon_inventory,
+        month_end_date
+    from 
+        ${ref('t_inventory_monthly_amazon')} 
+    qualify 
+        rank() over(partition by product_sku order by month_end_date desc) = 1
+),
+
+-- total inventory: consolidates all inventory streams into a single source of truth
+current_total_inventory as (
+    select 
+        prd.product_sku,
+        coalesce(stf.units_in_transit_to_ffe,0)                     as inventory_in_transit_to_ffe,
+        coalesce(ffe.units_running_sum_ffe, 0)                      as inventory_ffe, 
+        coalesce(ita.units_running_sum_in_transit, 0)               as inventory_in_transit_to_amz,
+        coalesce(ai.units_running_sum_amazon_inventory, 0)          as inventory_amz_inventory, 
+        coalesce(ffe.units_running_sum_ffe, 0) 
+            + coalesce(ita.units_running_sum_in_transit, 0) 
+            + coalesce(ai.units_running_sum_amazon_inventory, 0)    as total_inventory
+    from 
+        ${ref('dim_product')}                   prd
+        left join shipping_to_ffe               stf on stf.product_sku = prd.product_sku
+        left join current_ffe                   ffe on ffe.product_sku = prd.product_sku
+        left join current_in_transit_to_amazon  ita on ita.product_sku = prd.product_sku
+        left join current_amazon_inventory      ai  on ai.product_sku = prd.product_sku
+)
+
+select * from current_total_inventory
